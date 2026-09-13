@@ -8,34 +8,9 @@ Kiến trúc:
 """
 
 import json
-import os
 import re
 from typing import Dict, Any, List
 from tools import TOOL_DEFINITIONS, TOOL_MAP, search_product_catalog, submit_support_ticket
-
-try:
-    from llm_client import (
-        is_llm_available,
-        active_provider,
-        llm_plan,
-        llm_synthesize,
-        llm_baseline_answer,
-    )
-except ImportError:  # autograder chạy từ thư mục khác
-    try:
-        from starter_code.llm_client import (  # type: ignore
-            is_llm_available,
-            active_provider,
-            llm_plan,
-            llm_synthesize,
-            llm_baseline_answer,
-        )
-    except ImportError:
-        def is_llm_available() -> bool: return False
-        def active_provider() -> str: return "none"
-        def llm_plan(u: str): return None
-        def llm_synthesize(u: str, c, t) -> str: return ""
-        def llm_baseline_answer(u: str) -> str: return ""
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TODO 1: Thiết kế SYSTEM PROMPT cấp sản xuất
@@ -82,19 +57,10 @@ Mọi lượt suy luận tuân theo định dạng:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class ChatbotBaseline:
-    """Baseline LLM Chatbot — 1 lượt LLM thuần, không tool (quan sát hallucination)."""
+    """Baseline Chatbot — Mock Simulator, không dùng tool (quan sát hallucination)."""
 
     def query(self, user_input: str) -> Dict[str, Any]:
-        # LLM thật nếu có key, ngược lại mock để autograder vẫn chạy offline.
-        if is_llm_available():
-            answer = llm_baseline_answer(user_input)
-            if answer:
-                return {
-                    "answer": answer,
-                    "tool_calls": [],
-                    "status": "success",
-                    "mode": f"llm_{active_provider()}",
-                }
+        # TODO 2: Trả lời tĩnh (mock), không gọi tool.
         return {
             "answer": f"[Chatbot Baseline] Trả lời cho: {user_input}",
             "tool_calls": [],
@@ -108,82 +74,11 @@ class ChatbotBaseline:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class ToolCallingAgent:
-    """Agent ReAct: LLM thật lập plan + tổng hợp, tool Python chạy dữ liệu thật."""
+    """Agent Mock Simulator với System Prompt + Tool Calling."""
 
-    def __init__(self, max_iterations: int = 5, use_llm: bool = True):
+    def __init__(self, max_iterations: int = 5):
         self.max_iterations = max_iterations
-        self.use_llm = use_llm
         self.trace: List[Dict[str, Any]] = []
-
-    # ---------- Planning: LLM thật trước, rule-based fallback ----------
-    def _resolve_plan(self, user_input: str) -> Dict[str, Any]:
-        """Trả về plan chuẩn. Ưu tiên LLM thật, lỗi/thiếu key → rule cũ."""
-        if self.use_llm and is_llm_available():
-            plan = llm_plan(user_input)
-            if plan and isinstance(plan.get("needs_catalog"), bool) and isinstance(plan.get("needs_ticket"), bool):
-                self.trace.append({"step": "plan", "planner": f"llm_{active_provider()}", "plan": plan})
-                # Bổ sung field còn thiếu bằng rule để tool không crash
-                if plan.get("needs_catalog") and not plan.get("category"):
-                    plan["category"] = self._extract_category(user_input)
-                if plan.get("needs_catalog") and plan.get("max_price") is None:
-                    plan["max_price"] = self._extract_max_price(user_input)
-                if plan.get("needs_ticket") and not plan.get("customer_name"):
-                    plan["customer_name"] = self._extract_customer_name(user_input)
-                if not plan.get("issue_description"):
-                    plan["issue_description"] = user_input.strip()
-                return plan
-            self.trace.append({"step": "plan_fallback",
-                               "reason": "LLM plan invalid/empty, dùng rule-based"})
-        intents = self._detect_intents(user_input)
-        plan = {
-            "needs_catalog": intents["needs_catalog"],
-            "needs_ticket": intents["needs_ticket"],
-            "category": self._extract_category(user_input) if intents["needs_catalog"] else None,
-            "max_price": self._extract_max_price(user_input) if intents["needs_catalog"] else None,
-            "customer_name": self._extract_customer_name(user_input) if intents["needs_ticket"] else None,
-            "issue_description": user_input.strip(),
-            "priority": self._extract_priority(user_input),
-        }
-        self.trace.append({"step": "plan", "planner": "rule-based", "plan": plan})
-        return plan
-
-    def _synthesize(self, user_input: str, catalog_results, ticket_result) -> str:
-        """Final Answer: LLM thật tổng hợp từ Observation; guardrail giữ contract test."""
-        llm_text = ""
-        if self.use_llm and is_llm_available():
-            llm_text = llm_synthesize(user_input, catalog_results, ticket_result)
-        fallback = self._template_answer(user_input, catalog_results, ticket_result)
-        if not llm_text:
-            return fallback
-        # Guardrail: LLM không được làm mất dữ liệu load-bearing (tên xe, ticket_id, fallback).
-        if catalog_results:
-            names = [p.get("name", "") for p in catalog_results if "error" not in p]
-            if names and not any(n in llm_text for n in names):
-                return fallback
-            if not names and ("rất tiếc" not in llm_text.lower() and "không tìm thấy" not in llm_text.lower()):
-                return fallback
-        if ticket_result and ticket_result.get("ticket_id") not in llm_text:
-            return fallback
-        if catalog_results is None and ticket_result is None:
-            low = llm_text.lower()
-            if "bảo hành" in user_input.lower() and ("bảo hành" not in low and "10 năm" not in llm_text):
-                return fallback
-        return llm_text
-
-    def _template_answer(self, user_input: str, catalog_results, ticket_result) -> str:
-        """Câu trả lời mẫu determinist — cũng là fallback khi LLM rớt mạng."""
-        if catalog_results is not None and ticket_result is not None:
-            return (f"{self._format_catalog_answer(catalog_results)} Đồng thời, cảm ơn "
-                    f"{ticket_result.get('customer_name')}! Ticket {ticket_result.get('ticket_id')} "
-                    f"đã được tạo thành công với mức ưu tiên {ticket_result.get('priority')}.")
-        if catalog_results is not None:
-            return self._format_catalog_answer(catalog_results)
-        if ticket_result is not None:
-            return (f"Cảm ơn {ticket_result.get('customer_name')}! "
-                    f"Ticket {ticket_result.get('ticket_id')} đã được tạo thành công "
-                    f"với mức ưu tiên {ticket_result.get('priority')} "
-                    f"cho vấn đề: {user_input.strip()}. Chúng tôi sẽ xử lý sớm nhất.")
-        return self._faq_answer(user_input)
 
     # ---------- Intent Detection (TODO 3) ----------
     def _detect_intents(self, user_input: str) -> Dict[str, bool]:
@@ -339,13 +234,14 @@ class ToolCallingAgent:
         return " ".join(parts)
 
     def run(self, user_input: str) -> Dict[str, Any]:
-        """Điểm vào chính — ReAct loop: plan (LLM) → tool → synthesize (LLM)."""
+        """Điểm vào chính — Mock Simulator Agent Loop (TODO 3 + TODO 4)."""
         self.trace = []
         self.trace.append({"step": "init", "user_input": user_input})
 
-        plan = self._resolve_plan(user_input)
-        needs_catalog = bool(plan.get("needs_catalog"))
-        needs_ticket = bool(plan.get("needs_ticket"))
+        # TODO 3: Intent detection bằng keyword matching (catalog? ticket? cả hai? FAQ?)
+        intents = self._detect_intents(user_input)
+        needs_catalog = intents["needs_catalog"]
+        needs_ticket = intents["needs_ticket"]
 
         # Max Iterations Guard (Milestone 4.1)
         required_steps = (1 if needs_catalog else 0) + (1 if needs_ticket else 0)
@@ -364,12 +260,10 @@ class ToolCallingAgent:
         ticket_result = None
 
         while iteration <= self.max_iterations:
-            # Iteration: gọi catalog nếu plan yêu cầu và chưa gọi
+            # TODO 4 — Iteration: gọi catalog nếu cần và chưa gọi
             if needs_catalog and catalog_results is None:
-                category = plan.get("category") or self._extract_category(user_input)
-                max_price = plan.get("max_price")
-                if max_price is None:
-                    max_price = self._extract_max_price(user_input)
+                category = self._extract_category(user_input)
+                max_price = self._extract_max_price(user_input)
                 self.trace.append({"step": f"iteration_{iteration}",
                                    "thought": "Cần tra cứu catalog.",
                                    "action": "search_product_catalog",
@@ -380,16 +274,17 @@ class ToolCallingAgent:
                 if needs_ticket and ticket_result is None:
                     iteration += 1
                     continue
-                answer = self._synthesize(user_input, catalog_results, None)
+                # Tổng hợp Final Answer (catalog only)
+                answer = self._format_catalog_answer(catalog_results)
                 tool_count = (1 if needs_catalog else 0) + (1 if needs_ticket else 0)
                 return {"answer": answer, "trace": self.trace,
                         "iterations": max(1, tool_count), "status": "completed"}
 
-            # Iteration: gọi ticket nếu plan yêu cầu và chưa gọi
+            # TODO 4 — Iteration: gọi ticket nếu cần và chưa gọi
             if needs_ticket and ticket_result is None:
-                customer_name = plan.get("customer_name") or self._extract_customer_name(user_input)
-                priority = plan.get("priority") or self._extract_priority(user_input)
-                issue = plan.get("issue_description") or user_input.strip()
+                customer_name = self._extract_customer_name(user_input)
+                priority = self._extract_priority(user_input)
+                issue = user_input.strip()
                 self.trace.append({"step": f"iteration_{iteration}",
                                    "thought": "Cần tạo support ticket.",
                                    "action": "submit_support_ticket",
@@ -404,19 +299,26 @@ class ToolCallingAgent:
                     iteration += 1
                     continue
                 if needs_catalog:
-                    answer = self._synthesize(user_input, catalog_results, ticket_result)
+                    catalog_text = self._format_catalog_answer(catalog_results)
+                    answer = (f"{catalog_text} Đồng thời, cảm ơn "
+                              f"{ticket_result.get('customer_name')}! Ticket {ticket_result.get('ticket_id')} "
+                              f"đã được tạo thành công với mức ưu tiên {ticket_result.get('priority')}.")
                     return {"answer": answer, "trace": self.trace,
                             "iterations": 2, "status": "completed"}
-                answer = self._synthesize(user_input, None, ticket_result)
+                # Ticket only
+                answer = (f"Cảm ơn {ticket_result.get('customer_name')}! "
+                          f"Ticket {ticket_result.get('ticket_id')} đã được tạo thành công "
+                          f"với mức ưu tiên {ticket_result.get('priority')} "
+                          f"cho vấn đề: {user_input.strip()}. Chúng tôi sẽ xử lý sớm nhất.")
                 return {"answer": answer, "trace": self.trace,
                         "iterations": 1, "status": "completed"}
 
-            # FAQ: không cần tool → LLM (hoặc template) trả lời trực tiếp
+            # FAQ: không cần tool → trả lời trực tiếp
             if not needs_catalog and not needs_ticket:
                 self.trace.append({"step": f"iteration_{iteration}",
                                    "thought": "Câu hỏi FAQ, trả lời trực tiếp.",
                                    "action": "none"})
-                answer = self._synthesize(user_input, None, None)
+                answer = self._faq_answer(user_input)
                 return {"answer": answer, "trace": self.trace,
                         "iterations": 1, "status": "completed"}
 
@@ -434,7 +336,6 @@ class ToolCallingAgent:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main():
-    print(f"LLM provider: {active_provider()} (none = fallback rule-based)")
     user_query = "Tôi muốn xem xe điện VinFast giá dưới 600 triệu."
 
     print("=== RUNNING CHATBOT BASELINE ===")
